@@ -37,23 +37,23 @@ $$
 s_{\pi_t^R}(x) - s_{q_t}(x) = \nabla_x m_t(x).
 $$
 
-Applying [Trajectory Distribution Matching (TDM)](https://arxiv.org/abs/2503.06674) to the local transport map $T_\theta(x) = x - \delta v_\theta(x,t)$ and taking the infinitesimal step-size limit $\delta \downarrow 0$ aligns $v_\theta$ directly along this score correction: $\lim_{\delta\downarrow 0}\nabla_\theta \mathcal{K}_\delta(\theta) = \mathbb{E}_{q_t}[J_\theta^\top \nabla_x m_t(x_t)]$, where $J_\theta = \partial v_\theta / \partial \theta$. Via the Gaussian posterior-score identity and the tower property in the instantaneous limit, the intractable $\nabla_x m_t$ collapses into an **exact sample-level gradient** anchored at $v_q$—requiring *no* reward-tilted score network. Crucially, for any prompt-level baseline $b(c)$ and centered advantage $A = R - b(c)$, **exact baseline invariance** holds even under *behavior–policy mismatch* ($v_\theta \neq v_q$):
+Applying [Trajectory Distribution Matching (TDM)](https://arxiv.org/abs/2503.06674) to the local transport map $T_\theta(x) = x - \delta v_\theta(x,t)$ and taking the infinitesimal step-size limit $\delta \downarrow 0$ aligns $v_\theta$ directly along this score correction: $`\lim_{\delta\downarrow 0}\nabla_\theta \mathcal{K}_\delta(\theta) = \mathbb{E}_{q_t}[J_\theta^\top \nabla_x m_t(x_t)]`$, where $J_\theta = \partial v_\theta / \partial \theta$. Via the Gaussian posterior-score identity and the tower property in the instantaneous limit, the intractable $\nabla_x m_t$ collapses into an **exact sample-level gradient** anchored at $v_q$—requiring *no* reward-tilted score network. Crucially, for any prompt-level baseline $b(c)$ and centered advantage $A = R - b(c)$, **exact baseline invariance** holds even under *behavior–policy mismatch* ($v_\theta \neq v_q$):
 
-$$
+```math
 g_t^A := 2\,\mathbb{E}\!\left[A\,J_\theta^\top\big(v_q(x_t,t) - v(x_t \mid x_0)\big)\right] = g_t^R = \frac{2t}{1-t}\,\mathbb{E}_{q_t}\!\left[J_\theta^\top \nabla_x m_t(x_t)\right].
-$$
+```
 
-**Why Forward Diffusion RL Drifts/Collapse.** Existing forward diffusion RL methods (e.g., DGPO, DiffusionNFT, AWM) instead rely on *signed reward-weighted regression* (RWR) centered at $v_\theta$, $\mathcal{L}_{\mathrm{RWR}}^A(\theta) = \mathbb{E}\big[A\,\|v(x_t \mid x_0) - v_\theta(x_t,t)\|_2^2\big]$. Its population gradient decomposes into the iTDM gradient plus **two extraneous drift terms**:
+**Why Forward Diffusion RL Drifts/Collapse.** Existing forward diffusion RL methods (e.g., DGPO, DiffusionNFT, AWM) instead rely on *signed reward-weighted regression* (RWR) centered at $v_\theta$, $`\mathcal{L}_{\mathrm{RWR}}^A(\theta) = \mathbb{E}\big[A\,\|v(x_t \mid x_0) - v_\theta(x_t,t)\|_2^2\big]`$. Its population gradient decomposes into the iTDM gradient plus **two extraneous drift terms**:
 
-$$
+```math
 \nabla_\theta \mathcal{L}_{\mathrm{RWR}}^A = \underbrace{g_t^A}_{\text{iTDM gradient}} + \underbrace{2\,\mathbb{E}_{q_t}\!\big[m_t\,J_\theta^\top(v_\theta - v_q)\big]}_{\Delta_t^q:\ \text{drift toward } q_t} - \underbrace{2\,b(c)\,\mathbb{E}_{q_t}\!\big[J_\theta^\top(v_\theta - v_q)\big]}_{\Delta_t^b:\ \text{baseline-induced drift}}.
-$$
+```
 
 Whenever $v_\theta \neq v_q$—which inevitably arises under CFG-guided rollouts, offline/off-policy updates, and imperfect online self-consistency—signed RWR suffers from two side effects:
 1. **Baseline-induced gradient drift ($-\Delta_t^b$)**: subtracting $b(c) > 0$ breaks baseline invariance and pushes $v_\theta$ *away* from $v_q$ during gradient descent, causing unanchored RWR to collapse and anchored variants to stagnate or diverge under CFG-guided and offline RL.
 2. **Coarse rollout-artifact fitting ($\Delta_t^q$)**: since $m_t \ge 0$, $\Delta_t^q$ pulls $v_\theta$ toward the coarse few-step ODE behavior marginal $q_t$, fitting discretization artifacts and degrading visual textures and out-of-domain quality even at $\text{CFG} = 1.0$.
 
-By estimating $v_q$ online with a lightweight auxiliary LoRA denoiser $v_\phi$ (plugged in via stop-gradient $\mathrm{sg}(v_\phi)$) and regularizing $v_\theta$ toward the frozen reference $v_{\mathrm{ref}}$ rather than $q_t$, **iTDM eliminates both $-\Delta_t^b$ and $\Delta_t^q$** at the auxiliary optimum.
+By estimating $v_q$ online with a lightweight auxiliary LoRA denoiser $v_\phi$ (plugged in via stop-gradient $`\mathrm{sg}(v_\phi)`$) and regularizing $v_\theta$ toward the frozen reference $v_{\mathrm{ref}}$ rather than $q_t$, **iTDM eliminates both $-\Delta_t^b$ and $\Delta_t^q$** at the auxiliary optimum.
 
 ## Main Results
 

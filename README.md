@@ -142,7 +142,8 @@ All recipes are defined in [config/itdm.py](config/itdm.py); defaults that are n
 | --- | --- |
 | `config.train.learning_rate`, `config.train.adam_beta1`, `config.train.adam_beta2` | Optimizer of the policy LoRA (default lr `3e-4`). |
 | `config.train.dsm_learning_rate`, `config.train.dsm_adam_beta1`, `config.train.dsm_adam_beta2` | Optimizer of the DSM LoRA (default lr `3e-4`). |
-| `config.train.ttur` | Number of DSM updates per policy update. |
+| `config.train.gradient_accumulation_steps` | Each epoch runs first M DSM updates, then M policy updates, with M = `sample.num_batches_per_epoch / gradient_accumulation_steps` (must divide evenly). |
+| `config.train.ttur` | Run the policy phase once every `ttur` epochs; the DSM phase runs every epoch. |
 | `config.train.dsm_with_default` | `True`: the DSM forward stacks the frozen policy adapter and the trainable DSM adapter. `False`: DSM is a standalone adapter on the base model. |
 | `config.train.beta` | Weight $\beta$ of the velocity-MSE penalty to the frozen base model. 0 disables it. |
 | `config.sample.guidance_scale` | CFG used during rollout, evaluation, and the training-time policy and reference forwards; >1 enables CFG. The DSM adapter is always CFG-free. |

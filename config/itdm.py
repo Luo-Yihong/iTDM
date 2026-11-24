@@ -32,13 +32,14 @@ def itdm_sd3_8gpu():
     config.sample.num_batches_per_epoch = images_per_rollout // global_batch_size
     config.sample.group_batches = config.sample.num_batches_per_epoch
 
-    # Training: one policy update per rollout.
+    # Training: each epoch runs first M DSM updates, then M policy updates (never interleaved),
+    # where M = num_batches_per_epoch / gradient_accumulation_steps (must divide evenly).
     config.train.batch_size = config.sample.train_batch_size
-    config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch  # update once per rollout
+    config.train.gradient_accumulation_steps = config.sample.num_batches_per_epoch  # M = 1
     config.train.num_inner_epochs = 1
     config.num_train_timesteps = 4  # timesteps sampled per trajectory
     config.train.max_timestep_index = 8  # sample timestep indices from [0, max_timestep_index]
-    # Number of DSM updates per policy update.
+    # Run the policy phase once every `ttur` epochs (the DSM phase runs every epoch).
     config.train.ttur = 1
     # True: the DSM forward stacks the frozen policy adapter and the trainable DSM adapter.
     # False: DSM is a standalone adapter on the base model. DSM is always CFG-free.

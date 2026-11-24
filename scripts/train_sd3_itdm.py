@@ -591,11 +591,15 @@ def main(_):
     logger.info("")
     logger.info(f"  Total number of samples per epoch = {samples_per_epoch}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size}")
-    logger.info(f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}")
+    logger.info(
+        f"  Number of DSM updates, then policy updates, per inner epoch (M) = "
+        f"{config.sample.num_batches_per_epoch // config.train.gradient_accumulation_steps}"
+    )
     logger.info(f"  Number of inner epochs = {config.train.num_inner_epochs}")
 
     epoch = 0
-    global_step = 0  # Completed DSM updates; drives the TTUR schedule.
+    global_step = 0  # Completed policy updates.
+    dsm_step = 0  # Completed DSM updates.
     train_iter = iter(train_dataloader)
 
     while True:
@@ -614,7 +618,7 @@ def main(_):
         pipeline.transformer.eval()
         samples = []
         prompts = []
-        use_ema_rollout = config.switch_ema_ref >= 0 and global_step > config.switch_ema_ref
+        use_ema_rollout = config.switch_ema_ref >= 0 and dsm_step > config.switch_ema_ref
         if use_ema_rollout:
             ema_ref.copy_ema_to(transformer_trainable_parameters, store_temp=True)
         for i in tqdm(
@@ -793,17 +797,22 @@ def main(_):
             microsteps = [(sample, j) for sample in samples_batched for j in sampled_timesteps]
             accumulation_steps = accelerator.gradient_accumulation_steps
             if len(microsteps) % accumulation_steps:
-                raise ValueError("ITDM needs complete accumulation windows for DSM then policy updates")
+                raise ValueError(
+                    "config.train.gradient_accumulation_steps must divide config.sample.num_batches_per_epoch"
+                )
 
-            for start in tqdm(
-                range(0, len(microsteps), accumulation_steps),
-                desc=f"Epoch {epoch}.{inner_epoch}: DSM / policy every {ttur} steps",
+            # Strict two-phase order: first M DSM updates over all windows, then M policy updates over the
+            # same windows and noises, where M = num_batches_per_epoch // gradient_accumulation_steps.
+            # Never interleave DSM and policy updates.
+            windows = [microsteps[s:s + accumulation_steps] for s in range(0, len(microsteps), accumulation_steps)]
+            window_noises = [[torch.randn_like(sample["x0"]) for sample, _ in window] for window in windows]
+
+            # Phase 1: M DSM updates. All of them must finish before any policy update.
+            for window, noises in tqdm(
+                list(zip(windows, window_noises)),
+                desc=f"Epoch {epoch}.{inner_epoch}: DSM",
                 disable=not accelerator.is_local_main_process,
             ):
-                window = microsteps[start:start + accumulation_steps]
-                noises = [torch.randn_like(sample["x0"]) for sample, _ in window]
-
-                # One DSM update per accumulation window: fit the DSM adapter to the current rollouts.
                 for (sample, j), noise_diffuse in zip(window, noises):
                     embeds = sample["prompt_embeds"]
                     pooled_embeds = sample["pooled_prompt_embeds"]
@@ -828,83 +837,95 @@ def main(_):
                             info["dsm_grad_norm"].append(grad_norm.detach())
                         dsm_optimizer.step()
                         dsm_optimizer.zero_grad(set_to_none=True)
+                dsm_step += 1
 
-                # One policy update every `ttur` DSM updates, on the same window and noises.
-                if (global_step + 1) % ttur == 0:
-                    for (sample, j), noise_diffuse in zip(window, noises):
-                        embeds = sample["prompt_embeds"]
-                        pooled_embeds = sample["pooled_prompt_embeds"]
-                        cfg_kwargs = dict(
-                            cfg_scale=config.sample.guidance_scale,
-                            neg_embeds=train_neg_prompt_embeds[:len(embeds)],
-                            neg_pooled_embeds=train_neg_pooled_prompt_embeds[:len(pooled_embeds)],
+            training_model.set_adapter("default")
+            info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
+            info = accelerator.reduce(info, reduction="mean")
+            info.update({"epoch": epoch, "inner_epoch": inner_epoch, "dsm_step": dsm_step})
+            if accelerator.is_main_process:
+                wandb.log(info, step=global_step)
+
+            if (epoch + 1) % ttur:
+                continue
+
+            # Phase 2: M policy updates (every ttur epochs), using the DSM after all M updates.
+            for window, noises in tqdm(
+                list(zip(windows, window_noises)),
+                desc=f"Epoch {epoch}.{inner_epoch}: policy",
+                disable=not accelerator.is_local_main_process,
+            ):
+                info = defaultdict(list)
+                for (sample, j), noise_diffuse in zip(window, noises):
+                    embeds = sample["prompt_embeds"]
+                    pooled_embeds = sample["pooled_prompt_embeds"]
+                    cfg_kwargs = dict(
+                        cfg_scale=config.sample.guidance_scale,
+                        neg_embeds=train_neg_prompt_embeds[:len(embeds)],
+                        neg_pooled_embeds=train_neg_pooled_prompt_embeds[:len(pooled_embeds)],
+                    )
+                    with accelerator.accumulate(transformer):
+                        x0 = sample["x0"].detach()
+                        t = sample["timesteps"][:, j]
+                        sigmas_t = (t / 1000).reshape(-1, 1, 1, 1)
+                        xt = (1 - sigmas_t) * x0 + sigmas_t * noise_diffuse
+                        target_v = (noise_diffuse - x0).float()
+
+                        # Close this autocast context before the trainable forward so that
+                        # cached casts of frozen weights are not reused for policy gradients.
+                        with torch.no_grad(), autocast():
+                            online_v = training_model(xt, t, embeds, pooled_embeds, "dsm").float()
+                            training_model.set_adapter("default")
+                            with pipeline.transformer.disable_adapter():
+                                ref_v = predict_v(
+                                    pipeline.transformer, xt, t, embeds, pooled_embeds, **cfg_kwargs,
+                                ).float()
+                        with autocast():
+                            model_v = transformer(xt, t, embeds, pooled_embeds, "default", **cfg_kwargs).float()
+                        # Clipping slightly violates sum_G A = 0 but rarely triggers in practice.
+                        advantages = torch.clamp(
+                            sample["advantages"][:, j],
+                            -config.train.adv_clip_max,
+                            config.train.adv_clip_max,
                         )
-                        with accelerator.accumulate(transformer):
-                            x0 = sample["x0"].detach()
-                            t = sample["timesteps"][:, j]
-                            sigmas_t = (t / 1000).reshape(-1, 1, 1, 1)
-                            xt = (1 - sigmas_t) * x0 + sigmas_t * noise_diffuse
-                            target_v = (noise_diffuse - x0).float()
+                        r_normalized = advantages / 5
+                        # Reward-Driven Revision of the velocity
+                        model_v_revised = (model_v - r_normalized.view(-1, 1, 1, 1) * (online_v - target_v)).detach()
+                        itdm_policy_loss = (model_v - model_v_revised).square().mean()
+                        if config.train.beta > 0:
+                            kl_loss = (model_v - ref_v).square().mean()
+                            info["kl_loss"].append(kl_loss.detach())
+                            loss = itdm_policy_loss + config.train.beta * kl_loss
+                        else:
+                            loss = itdm_policy_loss
 
-                            # Close this autocast context before the trainable forward so that
-                            # cached casts of frozen weights are not reused for policy gradients.
-                            with torch.no_grad(), autocast():
-                                online_v = training_model(xt, t, embeds, pooled_embeds, "dsm").float()
-                                training_model.set_adapter("default")
-                                with pipeline.transformer.disable_adapter():
-                                    ref_v = predict_v(
-                                        pipeline.transformer, xt, t, embeds, pooled_embeds, **cfg_kwargs,
-                                    ).float()
-                            with autocast():
-                                model_v = transformer(xt, t, embeds, pooled_embeds, "default", **cfg_kwargs).float()
-                            # Clipping slightly violates sum_G A = 0 but rarely triggers in practice.
-                            advantages = torch.clamp(
-                                sample["advantages"][:, j],
-                                -config.train.adv_clip_max,
-                                config.train.adv_clip_max,
+                        info["itdm_policy_loss"].append(itdm_policy_loss.detach())
+                        info["policy_online_dsm_loss"].append((target_v - online_v).square().mean())
+
+                        accelerator.backward(loss)
+                        if accelerator.sync_gradients:
+                            accelerator.unscale_gradients(optimizer)
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                transformer_trainable_parameters, config.train.max_grad_norm,
                             )
-                            r_normalized = advantages / 5
-                            # Reward-Driven Revision of the velocity
-                            model_v_revised = (model_v - r_normalized.view(-1, 1, 1, 1) * (online_v - target_v)).detach()
-                            itdm_policy_loss = (model_v - model_v_revised).square().mean()
-                            if config.train.beta > 0:
-                                kl_loss = (model_v - ref_v).square().mean()
-                                info["kl_loss"].append(kl_loss.detach())
-                                loss = itdm_policy_loss + config.train.beta * kl_loss
-                            else:
-                                loss = itdm_policy_loss
+                            info["policy_grad_norm"].append(grad_norm.detach())
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
 
-                            info["itdm_policy_loss"].append(itdm_policy_loss.detach())
-                            info["online_dsm_loss"].append((target_v - online_v).square().mean())
-
-                            accelerator.backward(loss)
-                            if accelerator.sync_gradients:
-                                accelerator.unscale_gradients(optimizer)
-                                grad_norm = torch.nn.utils.clip_grad_norm_(
-                                    transformer_trainable_parameters, config.train.max_grad_norm,
-                                )
-                                info["policy_grad_norm"].append(grad_norm.detach())
-                            optimizer.step()
-                            optimizer.zero_grad(set_to_none=True)
-
-                    policy_step = (global_step + 1) // ttur
-                    ema_ref_decay = min(0.3, 0.001 * (policy_step - 1))
-                    ema_ref.step(transformer_trainable_parameters, policy_step - 1, decay=ema_ref_decay)
-                    if config.train.ema:
-                        ema.step(transformer_trainable_parameters, policy_step)
+                global_step += 1
+                ema_ref_decay = min(0.3, 0.001 * (global_step - 1))
+                ema_ref.step(transformer_trainable_parameters, global_step - 1, decay=ema_ref_decay)
+                if config.train.ema:
+                    ema.step(transformer_trainable_parameters, global_step)
 
                 training_model.set_adapter("default")
                 info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
                 info = accelerator.reduce(info, reduction="mean")
-                info.update({
-                    "epoch": epoch, "inner_epoch": inner_epoch,
-                    "dsm_step": global_step + 1, "policy_step": (global_step + 1) // ttur,
-                })
+                info.update({"epoch": epoch, "inner_epoch": inner_epoch, "dsm_step": dsm_step})
                 if accelerator.is_main_process:
                     wandb.log(info, step=global_step)
-                global_step += 1
 
-                if max_policy_steps and global_step // ttur >= max_policy_steps:
+                if max_policy_steps and global_step >= max_policy_steps:
                     accelerator.wait_for_everyone()
                     save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
                     accelerator.wait_for_everyone()
@@ -915,7 +936,6 @@ def main(_):
                     if accelerator.is_main_process:
                         wandb.finish()
                     return
-                info = defaultdict(list)
 
         epoch += 1
 

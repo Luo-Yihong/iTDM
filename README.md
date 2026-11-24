@@ -1,6 +1,11 @@
 # Reinforcing Diffusion Models by Instantaneous Trajectory Distribution Matching
 
-This is the official repository of **iTDM** (**I**nstantaneous **T**rajectory **D**istribution **M**atching), by *Yihong Luo*. Paper: [arXiv](https://arxiv.org/abs/2611.30986).
+<p align="center">
+  <a href="https://luo-yihong.github.io/iTDM/"><img src="https://img.shields.io/badge/Project_Page-iTDM-0f766e?style=for-the-badge&logo=githubpages&logoColor=white" alt="Project Page"></a>&ensp;
+  <a href="https://arxiv.org/abs/2611.30986"><img src="https://img.shields.io/badge/arXiv-2611.30986-b31b1b?style=for-the-badge&logo=arxiv&logoColor=white" alt="arXiv"></a>
+</p>
+
+This is the official repository of "[**iTDM: Reinforcing Diffusion Models by Instantaneous Trajectory Distribution Matching**](https://arxiv.org/abs/2611.30986)", by *[Yihong Luo](https://luo-yihong.github.io/)*.
 
 <table align="center">
   <tr>
@@ -27,7 +32,7 @@ This is the official repository of **iTDM** (**I**nstantaneous **T**rajectory **
 
 ## News
 
-- (2026/11) Training code is released.
+- (2026/11) [Paper](https://arxiv.org/abs/2611.30986), [Project Page](https://luo-yihong.github.io/iTDM/), and training code are released.
 
 ## Method
 

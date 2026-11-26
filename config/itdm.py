@@ -53,7 +53,7 @@ def itdm_sd3_8gpu():
     config.train.max_policy_steps = 3000
     config.switch_ema_ref = -1  # always roll out with the current policy
     # The DSM optimizer uses no momentum.
-    config.train.dsm_adam_beta1 = 0.0
+    config.train.dsm_adam_beta1 = 0.9
     return config
 
 
